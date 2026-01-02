@@ -3,7 +3,6 @@
 from cosyvoice.cli.cosyvoice import CosyVoice2
 from openai import OpenAI
 import argparse
-import time
 import os
 from backend import run_pipeline
 import re
@@ -15,7 +14,6 @@ client = OpenAI(
 )
 from cosyvoice.cli.cosyvoice import CosyVoice2
 
-t1 = time.time()
 parser = argparse.ArgumentParser()
 parser.add_argument("--audio", type=str,
                     help="输入音频文件路径")
@@ -65,6 +63,3 @@ run_pipeline(audio_path = args.audio,
              cosyvoice = cosyvoice,
              bg_img = args.bg_img,
              position = args.position)
-
-t2 = time.time()
-print(t2 - t1)

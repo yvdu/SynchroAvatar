@@ -43,19 +43,16 @@ pipe = pipeline(
 llm = HuggingFacePipeline(pipeline=pipe)
 
 # ========== 获取文本内容 ==========
-if args.text is None:  # 如果没传入，就自动调用模型生成
-    prompt = "请为我介绍一下什么是大模型"
-    messages = [{"role": "user", "content": prompt}]
-    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+prompt = args.text
+messages = [{"role": "user", "content": prompt}]
+text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
 
-    generated_ids = model.generate(**model_inputs, max_new_tokens=1024)
-    output_ids = generated_ids[0][len(model_inputs.input_ids[0]):].tolist()
-    content = tokenizer.decode(output_ids, skip_special_tokens=True)
-    print("General Chat:", content)
-else:
-    content = args.text
-    print("Use provided text:", content)
+generated_ids = model.generate(**model_inputs, max_new_tokens=1024)
+output_ids = generated_ids[0][len(model_inputs.input_ids[0]):].tolist()
+content = tokenizer.decode(output_ids, skip_special_tokens=True)
+print("General Chat:", content)
+
 
 # ========== 清理内存 ==========
 del model, tokenizer, pipe, llm, model_inputs, generated_ids, output_ids

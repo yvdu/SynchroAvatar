@@ -2,7 +2,6 @@
 from cosyvoice.cli.cosyvoice import CosyVoice2
 from openai import OpenAI
 import argparse
-import time
 import os
 from backend_continue import run_pipeline
 import re
@@ -34,8 +33,6 @@ def main():
                         help="输入音频文件路径")
     parser.add_argument("--image", type=str,
                         help="输入图像文件路径")
-    parser.add_argument("--text", type=str, default=None,
-                        help="输入文本。如果为空则调用模型生成")
     args = parser.parse_args()
 
     # 初始化 API
