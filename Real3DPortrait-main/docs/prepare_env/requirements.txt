@@ -1,0 +1,6 @@
+pyaudio #!!!!!!!!!!!!!!!!!!!!!!!!!! for extract esperanto
+webrtcvad #!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+dlib    #!!!!!!!!!!!!!!!!!!!!!
+python inference/real3d_infer.py \
+--src_img data/raw/examples/index.png\
+--drv_aud data/raw/examples/index.wav
