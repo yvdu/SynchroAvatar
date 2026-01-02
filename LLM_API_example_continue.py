@@ -4,7 +4,7 @@ from openai import OpenAI
 import argparse
 import time
 import os
-from main_backend_continue import run_pipeline
+from backend_continue import run_pipeline
 import re
 import sys
 sys.path.append(os.path.abspath("CosyVoice-main"))

@@ -2,7 +2,7 @@ import os
 import argparse
 import sys
 sys.path.append(os.path.abspath("CosyVoice-main"))
-from test_voise2 import run_test_voice2
+from voice_utils import run_test_voice2
 from cosyvoice.cli.cosyvoice import CosyVoice2
 import time
 from moviepy.editor import VideoFileClip, AudioFileClip
@@ -24,7 +24,7 @@ def run_pipeline(audio_path: str, image_path: str, out_text: str, bg_img: str, p
                     pt_name = "temp_chinese.pt",
                     text = out_text,
                     cosyvoice = cosyvoice)
-    #os.system(f'python test_voise2.py --voice_path "{audio_path}" --pt_name temp_chinese.pt --text "{out_text}"')
+    #os.system(f'python voice_utils.py --voice_path "{audio_path}" --pt_name temp_chinese.pt --text "{out_text}"')
     print("音频合成成功")
     t2 = time.time()
     print("CosyVoice", t2 - t1)

@@ -4,7 +4,7 @@ from PyQt5.QtWidgets import (
     QApplication, QWidget, QPushButton, QVBoxLayout,
     QFileDialog, QLineEdit, QComboBox, QLabel
 )
-from main_backend2 import run_pipeline
+from backend import run_pipeline
 
 class MainWindow(QWidget):
     def __init__(self):
@@ -118,7 +118,7 @@ class MainWindow(QWidget):
         # Prepare the command to run the backend script
         '''
         command = [
-            'python3', 'main_backend2.py',
+            'python3', 'backend.py',
             '--audio', self.audio_path,
             '--image', self.image_path,
             '--bg_path', self.bg_path,
