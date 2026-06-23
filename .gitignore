@@ -1,0 +1,35 @@
+# ---- 模型权重 / 大文件（绝不提交，单独用 download_models.py 下载）----
+pretrained_models/
+checkpoints/
+deep_3drecon/BFM/
+*.ckpt
+*.pth
+*.pt
+*.onnx
+*.safetensors
+*.bin
+hubert*/
+
+# ---- 运行时产物 ----
+realtime/out/
+realtime/uploads/
+infer_out/
+picture/
+*.mp4
+*.wav
+*.mp3
+output.log
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.ipynb_checkpoints/
+.venv/
+venv/
+
+# ---- IDE / OS ----
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

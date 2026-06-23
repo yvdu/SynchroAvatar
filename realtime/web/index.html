@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<title>SynchroAvatar Realtime</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 960px; margin: 30px auto; padding: 0 20px; }
+  fieldset { margin-bottom: 16px; }
+  label { display: inline-block; min-width: 100px; }
+  .row { margin: 6px 0; }
+  #log { background: #111; color: #0f0; padding: 10px; height: 220px; overflow: auto; font-family: monospace; font-size: 12px; white-space: pre-wrap; }
+  #subs { background: #fafafa; border: 1px solid #ddd; padding: 8px; min-height: 60px; }
+  .sub-line { padding: 2px 6px; border-radius: 4px; margin: 2px 0; background: #eef; }
+  .sub-line.playing { background: #ffe; font-weight: bold; }
+  video { width: 100%; max-width: 720px; background: #000; }
+  button { padding: 6px 14px; }
+  .pill { display: inline-block; padding: 2px 8px; border-radius: 10px; background: #eee; font-size: 12px; }
+  .ok { background: #c8f7c5; }
+  .err { background: #f7c5c5; }
+</style>
+</head>
+<body>
+
+<h2>SynchroAvatar 实时数字人 <span id="status" class="pill">未配置</span></h2>
+
+<fieldset>
+  <legend>① 会话配置（首次必须执行）</legend>
+  <div class="row"><label>人脸图：</label><input type="file" id="srcImage" accept="image/*"></div>
+  <div class="row"><label>背景图：</label><input type="file" id="bgImage" accept="image/*">（可选）</div>
+  <div class="row"><label>参考音频：</label><input type="file" id="promptAudio" accept="audio/*"></div>
+  <div class="row"><label>参考文本：</label><input type="text" id="promptText" placeholder="参考音频对应的文本，可留空" size="50"></div>
+  <div class="row">
+    <label>人物位置：</label>
+    <select id="position">
+      <option value="center">中间</option>
+      <option value="left_top">左上</option>
+      <option value="right_top">右上</option>
+      <option value="left_bottom">左下</option>
+      <option value="right_bottom">右下</option>
+    </select>
+  </div>
+  <div class="row">
+    <button id="btnConfig">提交配置</button>
+    <button id="btnResetMem">清空对话记忆</button>
+  </div>
+</fieldset>
+
+<fieldset>
+  <legend>② 文本输入（P0/P2）</legend>
+  <div class="row">
+    <input type="text" id="textInput" size="60" placeholder="对数字人说点什么..." />
+    <button id="btnSendText">发送</button>
+  </div>
+</fieldset>
+
+<fieldset>
+  <legend>③ 语音输入（P1/P2）</legend>
+  <div class="row">
+    <button id="btnMic">开始说话</button>
+    <button id="btnMicStop" disabled>停止</button>
+    <span id="micState" class="pill">未连接</span>
+  </div>
+</fieldset>
+
+<fieldset>
+  <legend>数字人回放（按 seq 顺序流式播放）</legend>
+  <video id="video" controls autoplay playsinline></video>
+  <div class="row">字幕：<div id="subs"></div></div>
+</fieldset>
+
+<fieldset>
+  <legend>日志</legend>
+  <div id="log"></div>
+</fieldset>
+
+<script>
+const $ = (id) => document.getElementById(id);
+function logMsg(msg) {
+  const el = $('log');
+  const t = new Date().toLocaleTimeString();
+  el.textContent += `[${t}] ${msg}\n`;
+  el.scrollTop = el.scrollHeight;
+}
+
+// 多用户：每个浏览器持有自己的会话令牌 sid，所有 WS 连接都带上它
+let sid = '';
+
+// ----------- 配置 -----------
+$('btnConfig').onclick = async () => {
+  const fd = new FormData();
+  if (!$('srcImage').files[0]) { alert('请选择人脸图'); return; }
+  if (!$('promptAudio').files[0]) { alert('请选择参考音频'); return; }
+  fd.append('src_image', $('srcImage').files[0]);
+  fd.append('prompt_audio', $('promptAudio').files[0]);
+  fd.append('prompt_text', $('promptText').value || '');
+  fd.append('position', $('position').value);
+  if ($('bgImage').files[0]) fd.append('bg_image', $('bgImage').files[0]);
+  if (sid) fd.append('sid', sid);   // 复用已有会话
+
+  logMsg('uploading config ...');
+  const r = await fetch('/api/config', { method: 'POST', body: fd });
+  const j = await r.json();
+  if (j.ok) {
+    sid = j.sid || sid;
+    $('status').textContent = '已配置 (' + sid.slice(0, 6) + ')';
+    $('status').className = 'pill ok';
+    logMsg('config OK, sid=' + sid);
+  } else {
+    $('status').textContent = '配置失败';
+    $('status').className = 'pill err';
+    logMsg('config FAIL: ' + JSON.stringify(j));
+  }
+};
+
+$('btnResetMem').onclick = async () => {
+  if (!sid) { alert('请先提交配置'); return; }
+  const fd = new FormData();
+  fd.append('sid', sid);
+  await fetch('/api/reset_memory', { method: 'POST', body: fd });
+  logMsg('memory cleared');
+};
+
+// ----------- 视频播放队列（按 seq 顺序，按 roundId 隔离） -----------
+// 服务端按 seq 顺序推送 video_chunk；这里再按 seq 排序后串行播放。
+// P4 全双工：每个回合带 round_id，用户开新口立即 interrupt 旧回合，
+// 新回合的事件不与旧回合混淆。
+const playQueue = [];   // {seq, url, roundId}
+let playing = false;
+let expectedSeq = 0;    // 期望播放的下一个 seq
+let currentRoundId = 0; // 当前正在播放/接收的回合 id（0 表示无）
+
+function resetPlayback(roundId) {
+  playQueue.length = 0;
+  expectedSeq = 1;
+  currentRoundId = roundId || 0;
+  $('subs').innerHTML = '';
+  // 不强制设置 playing=false：让正在播的视频自然结束 / 由 interrupt 显式停
+}
+
+function interruptPlayback(reason) {
+  // P4 关键：立即停播 + 清队列。
+  const v = $('video');
+  try { v.pause(); } catch {}
+  try { v.removeAttribute('src'); v.load(); } catch {}
+  playQueue.length = 0;
+  playing = false;
+  // 字幕标记
+  const lines = $('subs').querySelectorAll('.sub-line');
+  lines.forEach((el) => el.classList.remove('playing'));
+  const tag = document.createElement('div');
+  tag.style.color = '#a00';
+  tag.style.fontSize = '12px';
+  tag.textContent = `[interrupted: ${reason || ''}]`;
+  $('subs').appendChild(tag);
+}
+
+function enqueueChunk(seq, url, roundId) {
+  // 老回合的 chunk 直接丢弃（理论上服务端已经 cancel，但网络在途可能到达）
+  if (roundId && currentRoundId && roundId !== currentRoundId) return;
+  playQueue.push({ seq, url, roundId });
+  playQueue.sort((a, b) => a.seq - b.seq);
+  tryPlayNext();
+}
+
+function tryPlayNext() {
+  if (playing) return;
+  if (!playQueue.length) return;
+  if (playQueue[0].seq !== expectedSeq) return;
+  const item = playQueue.shift();
+  playing = true;
+  expectedSeq = item.seq + 1;
+
+  // 高亮当前字幕
+  const lines = $('subs').querySelectorAll('.sub-line');
+  lines.forEach((el) => {
+    if (parseInt(el.dataset.seq, 10) === item.seq) el.classList.add('playing');
+    else el.classList.remove('playing');
+  });
+
+  const v = $('video');
+  v.src = item.url + '?t=' + Date.now();
+  v.play().catch(() => {});
+  v.onended = () => {
+    playing = false;
+    tryPlayNext();
+  };
+}
+
+function appendSub(seq, text) {
+  const div = document.createElement('div');
+  div.className = 'sub-line';
+  div.dataset.seq = seq;
+  div.textContent = `[${seq}] ${text}`;
+  $('subs').appendChild(div);
+}
+
+// ----------- 文本 WS -----------
+let wsText = null;
+function ensureTextWs() {
+  if (wsText && wsText.readyState === WebSocket.OPEN) return wsText;
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  wsText = new WebSocket(`${proto}://${location.host}/ws/text?sid=${encodeURIComponent(sid)}`);
+  wsText.onopen = () => logMsg('[text-ws] open');
+  wsText.onclose = () => logMsg('[text-ws] close');
+  wsText.onerror = () => logMsg('[text-ws] error');
+  wsText.onmessage = (ev) => onServerMsg('text', ev.data);
+  return wsText;
+}
+
+$('btnSendText').onclick = () => {
+  const t = $('textInput').value.trim();
+  if (!t) return;
+  if (!sid) { alert('请先提交配置'); return; }
+  // 不主动 resetPlayback：服务端 round_start 事件会处理
+  // 但要立即停掉当前播放，让"用文本打断"也即时生效
+  interruptPlayback('new_text_input');
+  const ws = ensureTextWs();
+  const send = () => ws.send(JSON.stringify({ text: t }));
+  if (ws.readyState === WebSocket.OPEN) send();
+  else ws.addEventListener('open', send, { once: true });
+  logMsg(`-> ${t}`);
+};
+
+function onServerMsg(channel, raw) {
+  let msg;
+  try { msg = JSON.parse(raw); } catch { logMsg(`[${channel}] ${raw}`); return; }
+  switch (msg.type) {
+    case 'accepted':
+      logMsg(`[accepted] ${msg.text}`);
+      break;
+    case 'round_start':
+      logMsg(`[round #${msg.round_id}] start`);
+      resetPlayback(msg.round_id);
+      break;
+    case 'interrupt':
+      logMsg(`[interrupt #${msg.round_id}] ${msg.reason || ''}`);
+      interruptPlayback(msg.reason);
+      break;
+    case 'speech_start':
+      logMsg('[asr] speech start');
+      // 用户开口立即停播——即使服务端 interrupt 还没到，本地先停
+      interruptPlayback('local_speech_start');
+      break;
+    case 'final':
+      logMsg(`[asr final] ${msg.text}`);
+      break;
+    case 'llm_sentence':
+      // 老回合的句子直接忽略
+      if (msg.round_id && currentRoundId && msg.round_id !== currentRoundId) break;
+      logMsg(`[llm #${msg.seq}] ${msg.text}`);
+      appendSub(msg.seq, msg.text);
+      break;
+    case 'video_chunk':
+      if (msg.round_id && currentRoundId && msg.round_id !== currentRoundId) {
+        logMsg(`[drop stale chunk #${msg.seq}]`);
+        break;
+      }
+      logMsg(`[chunk #${msg.seq}] ${msg.url}`);
+      enqueueChunk(msg.seq, msg.url, msg.round_id);
+      break;
+    case 'done':
+      logMsg(`[done #${msg.round_id || ''}]`);
+      break;
+    case 'error':
+      logMsg('[error] ' + (msg.msg || ''));
+      break;
+    default:
+      logMsg(`[${channel}] ` + JSON.stringify(msg));
+  }
+}
+
+// ----------- 音频 WS（AudioWorklet 推 16k Int16 PCM） -----------
+let wsAudio = null;
+let audioCtx = null;
+let micNode = null;
+let workletNode = null;
+
+const WORKLET_CODE = `
+class PCM16Worklet extends AudioWorkletProcessor {
+  constructor() {
+    super();
+    this._buf = new Float32Array(0);
+    this._chunk = 320;   // 20ms @ 16k
+  }
+  process(inputs) {
+    const input = inputs[0];
+    if (!input || !input[0]) return true;
+    const ch = input[0];
+    const merged = new Float32Array(this._buf.length + ch.length);
+    merged.set(this._buf, 0);
+    merged.set(ch, this._buf.length);
+    this._buf = merged;
+    while (this._buf.length >= this._chunk) {
+      const slice = this._buf.subarray(0, this._chunk);
+      const i16 = new Int16Array(this._chunk);
+      for (let i = 0; i < this._chunk; i++) {
+        let s = Math.max(-1, Math.min(1, slice[i]));
+        i16[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+      }
+      this.port.postMessage(i16.buffer, [i16.buffer]);
+      this._buf = this._buf.slice(this._chunk);
+    }
+    return true;
+  }
+}
+registerProcessor('pcm16-worklet', PCM16Worklet);
+`;
+
+async function startMic() {
+  if (wsAudio && wsAudio.readyState === WebSocket.OPEN) return;
+  if (!sid) { alert('请先提交配置'); return; }
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  wsAudio = new WebSocket(`${proto}://${location.host}/ws/audio?sid=${encodeURIComponent(sid)}`);
+  wsAudio.binaryType = 'arraybuffer';
+  wsAudio.onopen = () => { logMsg('[audio-ws] open'); $('micState').textContent = '连接中…'; };
+  wsAudio.onclose = () => { logMsg('[audio-ws] close'); $('micState').textContent = '已断开'; };
+  wsAudio.onerror = () => logMsg('[audio-ws] error');
+  wsAudio.onmessage = (ev) => onServerMsg('audio', ev.data);
+
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
+  if (audioCtx.sampleRate !== 16000) {
+    logMsg(`warn: audioCtx sampleRate=${audioCtx.sampleRate}, not 16000; ASR may degrade`);
+  }
+
+  const blob = new Blob([WORKLET_CODE], { type: 'application/javascript' });
+  const url = URL.createObjectURL(blob);
+  await audioCtx.audioWorklet.addModule(url);
+
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    video: false,
+  });
+  micNode = audioCtx.createMediaStreamSource(stream);
+  workletNode = new AudioWorkletNode(audioCtx, 'pcm16-worklet');
+  workletNode.port.onmessage = (e) => {
+    if (wsAudio && wsAudio.readyState === WebSocket.OPEN) wsAudio.send(e.data);
+  };
+  micNode.connect(workletNode);
+  // 不连到 destination，避免回放噪声
+
+  $('micState').textContent = '录音中';
+  $('btnMic').disabled = true;
+  $('btnMicStop').disabled = false;
+}
+
+async function stopMic() {
+  try { workletNode && workletNode.disconnect(); } catch {}
+  try { micNode && micNode.disconnect(); } catch {}
+  try { audioCtx && (await audioCtx.close()); } catch {}
+  try { wsAudio && wsAudio.close(); } catch {}
+  workletNode = micNode = audioCtx = wsAudio = null;
+  $('micState').textContent = '已停止';
+  $('btnMic').disabled = false;
+  $('btnMicStop').disabled = true;
+}
+
+$('btnMic').onclick = () => startMic().catch((e) => { logMsg('mic err: ' + e); });
+$('btnMicStop').onclick = () => stopMic();
+</script>
+
+</body>
+</html>

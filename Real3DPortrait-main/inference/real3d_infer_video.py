@@ -250,20 +250,112 @@ class GeneFace2Infer:
 
         return bg_img
 
+    def _static_cache_key(self, inp):
+        """缓存键：只要 人脸图/背景图/位置/裁剪阈值 不变，图像侧预处理就能复用。"""
+        return (
+            str(inp.get('src_image_name', '')),
+            str(inp.get('bg_image_name', '')),
+            str(inp.get('position', 'center')),
+            float(inp.get('min_face_area_percent', 0.2)),
+        )
+
+    def prepare_static_sample(self, inp):
+        """计算"只跟人脸图/背景图相关"的字段并缓存（LRU）。
+
+        实时多句对话里，人脸图与背景在一次会话内固定不变，但原实现每句都重跑：
+        MediaPipe 人脸分割 + 躯干 inpaint + 3DMM 拟合（都很慢）。
+        这里按 _static_cache_key 缓存，命中后直接复用，省掉每句的重复预处理。
+
+        返回的张量已搬到 cuda，可被多次推理共享读取（推理是 no_grad 只读）。
+        """
+        from collections import OrderedDict
+
+        cache = getattr(self, "_static_cache", None)
+        if cache is None:
+            cache = self._static_cache = OrderedDict()
+        max_entries = int(getattr(self, "_static_cache_max", 4))
+
+        key = self._static_cache_key(inp)
+        if key in cache:
+            cache.move_to_end(key)  # LRU 命中刷新
+            print("[r3d] static image cache HIT")
+            return cache[key]
+
+        print("[r3d] static image cache MISS -> preprocessing image/bg/3dmm ...")
+        tmp_img_name = 'infer_out/tmp/cropped_src_img.png'
+        _, area = crop_img_on_face_area_percent(
+            inp['src_image_name'], tmp_img_name, min_face_area_percent=inp['min_face_area_percent']
+        )
+
+        image_name = tmp_img_name
+        if image_name.endswith(".mp4"):
+            img = read_first_frame_from_a_video(image_name)
+            image_name = image_name[:-4] + '.png'
+            cv2.imwrite(image_name, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
+
+        ref_gt_img = load_img_to_normalized_512_bchw_tensor(image_name).cuda()
+        img = load_img_to_512_hwc_array(image_name)
+        segmap = self.seg_model._cal_seg_map(img)
+        segmap_t = torch.tensor(segmap).float().unsqueeze(0).cuda()
+        head_img = self.seg_model._seg_out_img_with_segmap(img, segmap, mode='head')[0]
+        ref_head_img = ((torch.tensor(head_img) - 127.5) / 127.5).float().unsqueeze(0).permute(0, 3, 1, 2).cuda()
+        inpaint_torso_img, _, _, _ = inpaint_torso_job(img, segmap)
+        ref_torso_img = ((torch.tensor(inpaint_torso_img) - 127.5) / 127.5).float().unsqueeze(0).permute(0, 3, 1, 2).cuda()
+
+        if inp['bg_image_name'] == '':
+            bg_img = extract_background([img], [segmap], 'knn')
+        else:
+            try:
+                bg_img = self.prepare_bg_image(bg_path=f"{inp['bg_image_name']}", crop_position=inp['position'])
+            except Exception:
+                bg_img = cv2.imread(inp['bg_image_name'])
+                bg_img = cv2.cvtColor(bg_img, cv2.COLOR_BGR2RGB)
+                bg_img = cv2.resize(bg_img, (512, 512))
+        bg_img_t = ((torch.tensor(bg_img) - 127.5) / 127.5).float().unsqueeze(0).permute(0, 3, 1, 2).cuda()
+
+        # 3DMM identity / pose（图像侧，固定）
+        coeff_dict = fit_3dmm_for_a_image(image_name, save=False)
+        assert coeff_dict is not None
+        src_id = torch.tensor(coeff_dict['id']).reshape([1, 80]).cuda()
+        src_exp = torch.tensor(coeff_dict['exp']).reshape([1, 64]).cuda()
+        src_euler = torch.tensor(coeff_dict['euler']).reshape([1, 3]).cuda()
+        src_trans = torch.tensor(coeff_dict['trans']).reshape([1, 3]).cuda()
+        src_kp = self.face3d_helper.reconstruct_lm2d(src_id, src_exp, src_euler, src_trans)  # [1,68,2]
+        src_kp = (src_kp - 0.5) / 0.5
+        src_kp = torch.clamp(src_kp, -1, 1)  # [1,68,2]
+
+        entry = {
+            'cropped_image_name': image_name,
+            'area': area,
+            'ref_gt_img': ref_gt_img,
+            'segmap': segmap_t,
+            'ref_head_img': ref_head_img,
+            'ref_torso_img': ref_torso_img,
+            'bg_img': bg_img_t,
+            'coeff_dict': coeff_dict,
+            'src_id': src_id,
+            'src_kp': src_kp,
+        }
+        cache[key] = entry
+        cache.move_to_end(key)
+        while len(cache) > max_entries:
+            cache.popitem(last=False)  # 淘汰最久未用
+        return entry
+
     def prepare_batch_from_inp(self, inp):
         """
         :param inp: {'audio_source_name': (str)}
         :return: a dict that contains the condition feature of NeRF
         """
-        tmp_img_name = 'infer_out/tmp/cropped_src_img.png'
-        a,area = crop_img_on_face_area_percent(inp['src_image_name'], tmp_img_name, min_face_area_percent=inp['min_face_area_percent'])
-        inp['src_image_name'] = tmp_img_name
-        #print(a, "00000000000000000", area)
+        # ---- 图像侧（可缓存）----
+        static = self.prepare_static_sample(inp)
+        inp['src_image_name'] = static['cropped_image_name']
+        area = static['area']
         inp['area'] = area
 
         sample = {}
         sample['area'] = area
-        # Process Driving Motion
+        # Process Driving Motion（音频侧，每句都要算）
         if inp['drv_audio_name'][-4:] in ['.wav', '.mp3']:
             self.save_wav16k(inp['drv_audio_name'])
             if self.audio2secc_hparams['audio_type'] == 'hubert':
@@ -301,53 +393,19 @@ class GeneFace2Infer:
             t_x = drv_motion_coeff_dict['exp'].shape[0] * 2
             self.drv_motion_coeff_dict = drv_motion_coeff_dict
 
-        # Face Parsing
-        image_name = inp['src_image_name']
-        if image_name.endswith(".mp4"):
-            img = read_first_frame_from_a_video(image_name)
-            image_name = inp['src_image_name'] = image_name[:-4] + '.png'
-            cv2.imwrite(image_name, cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
-        sample['ref_gt_img'] = load_img_to_normalized_512_bchw_tensor(image_name).cuda()
-        img = load_img_to_512_hwc_array(image_name)
-        segmap = self.seg_model._cal_seg_map(img)
-        sample['segmap'] = torch.tensor(segmap).float().unsqueeze(0).cuda()
-        head_img = self.seg_model._seg_out_img_with_segmap(img, segmap, mode='head')[0]
-        sample['ref_head_img'] = ((torch.tensor(head_img) - 127.5)/127.5).float().unsqueeze(0).permute(0, 3, 1,2).cuda() # [b,c,h,w]
-        print(sample['ref_head_img'].shape)
-        print(sample['ref_head_img'].size())
-        ts.save(sample['ref_head_img'])
-        inpaint_torso_img, _, _, _ = inpaint_torso_job(img, segmap)
-        sample['ref_torso_img'] = ((torch.tensor(inpaint_torso_img) - 127.5)/127.5).float().unsqueeze(0).permute(0, 3, 1,2).cuda() # [b,c,h,w]
-        
-        if inp['bg_image_name'] == '':
-            bg_img = extract_background([img], [segmap], 'knn')
-        else:
-            try:
-                print(inp['bg_image_name'], "inp['bg_image_name']")
-                print(type(inp['bg_image_name']), "inp['bg_image_name']")
-                back_name = inp['bg_image_name']
-                bg_img = self.prepare_bg_image(bg_path = f'{back_name}',crop_position = inp['position'])
-            except:
-                print(inp['bg_image_name'],"inp['bg_image_name']")
-                print(type(inp['bg_image_name']), "inp['bg_image_name']")
-                bg_img = cv2.imread(inp['bg_image_name'])
-                bg_img = cv2.cvtColor(bg_img, cv2.COLOR_BGR2RGB)
-                bg_img = cv2.resize(bg_img, (512,512))
-        sample['bg_img'] = ((torch.tensor(bg_img) - 127.5)/127.5).float().unsqueeze(0).permute(0, 3, 1,2).cuda() # [b,c,h,w]
+        # ---- 复用缓存的图像侧字段 ----
+        sample['ref_gt_img'] = static['ref_gt_img']
+        sample['segmap'] = static['segmap']
+        sample['ref_head_img'] = static['ref_head_img']
+        sample['ref_torso_img'] = static['ref_torso_img']
+        sample['bg_img'] = static['bg_img']
 
-        # 3DMM, get identity code and camera pose
-        coeff_dict = fit_3dmm_for_a_image(image_name, save=False)
-        assert coeff_dict is not None
-        src_id = torch.tensor(coeff_dict['id']).reshape([1,80]).cuda()
-        src_exp = torch.tensor(coeff_dict['exp']).reshape([1,64]).cuda()
-        src_euler = torch.tensor(coeff_dict['euler']).reshape([1,3]).cuda()
-        src_trans = torch.tensor(coeff_dict['trans']).reshape([1,3]).cuda()
-        sample['id'] = src_id.repeat([t_x//2,1])
+        coeff_dict = static['coeff_dict']
+        src_id = static['src_id']
+        sample['id'] = src_id.repeat([t_x//2, 1])
 
-        # get the src_kp for torso model
-        src_kp = self.face3d_helper.reconstruct_lm2d(src_id, src_exp, src_euler, src_trans) # [1, 68, 2]
-        src_kp = (src_kp-0.5) / 0.5 # rescale to -1~1
-        sample['src_kp'] = torch.clamp(src_kp, -1, 1).repeat([t_x//2,1,1])
+        # src_kp 单帧缓存 -> 按帧数复制
+        sample['src_kp'] = static['src_kp'].repeat([t_x//2, 1, 1])
 
         # get camera pose file
         # random.seed(time.time())

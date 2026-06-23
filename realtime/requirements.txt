@@ -1,0 +1,18 @@
+# 实时服务额外依赖（在原 requirements.txt 之外）
+fastapi>=0.110
+uvicorn[standard]>=0.27
+python-multipart>=0.0.9
+soundfile>=0.12
+torchaudio
+faster-whisper>=1.0.0
+silero-vad>=5.1
+openai>=1.30          # P2: LLM 流式（OpenAI 兼容客户端，可指向任意 base_url）
+numpy
+
+# 权重下载脚本（download_models.py）依赖；按需触发
+modelscope>=1.10
+huggingface_hub>=0.20
+gdown>=5.1
+requests>=2.31
+
+
