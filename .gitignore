@@ -33,3 +33,10 @@ venv/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# ---- 误提交的第三方库源码 / 压缩包（用包管理器安装，勿入库）----
+**/portaudio/
+*.tgz
+*.tar
+*.tar.gz
+*.zip
